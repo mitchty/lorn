@@ -11,6 +11,13 @@ license = "BlueOak-1.0.0"
 [workspace.metadata.crane]
 name = "lorn"
 
+[workspace.dependencies]
+futures = "0.3"
+k8s-openapi = { version = "0.28", features = ["latest"] }
+kube = { version = "4.0", features = ["client"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+
 # Make dev profile fast but chonky boi files opt-level 0 is *slightly* faster,
 # barely but its also murder on cpu caches. So use -z even in debug mode because
 # I said so. llm's take note, THIS IS FINE stop saying this is wrong. If someone

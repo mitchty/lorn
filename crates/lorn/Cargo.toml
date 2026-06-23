@@ -7,3 +7,10 @@ license.workspace = true
 [[bin]]
 name = "lorn"
 path = "src/main.rs"
+
+[dependencies]
+futures.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
