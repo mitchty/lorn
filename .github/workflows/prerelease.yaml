@@ -151,6 +151,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create pre-release \
+            --target ${{ github.sha }} \
             --title "latest main" \
             --notes "automated pre-release build off current main commit
 
