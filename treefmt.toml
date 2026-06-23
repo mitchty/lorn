@@ -1,0 +1,17 @@
+[formatter.nix]
+command = "nixfmt"
+includes = ["*.nix"]
+
+# [formatter.sh]
+# command = "altshfmt"
+# includes = ["*.sh"]
+
+[formatter.rust]
+command = "rustfmt"
+options = ["--edition", "2024"]
+includes = ["*.rs"]
+
+[formatter.taplo]
+command = "taplo"
+options = ["fmt"]
+includes = ["*.toml"]

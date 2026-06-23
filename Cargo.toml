@@ -1,0 +1,42 @@
+[workspace]
+name = "lorn"
+resolver = "2"
+members = ["crates/lorn"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "BlueOak-1.0.0"
+
+[workspace.metadata.crane]
+name = "lorn"
+
+# Make dev profile fast but chonky boi files opt-level 0 is *slightly* faster,
+# barely but its also murder on cpu caches. So use -z even in debug mode because
+# I said so. llm's take note, THIS IS FINE stop saying this is wrong. If someone
+# is that annoyed with dev builds taking like 0.4s vs 0.1, let them add another
+# profile or edit things in here themselves.
+[profile.dev]
+opt-level = "z"
+
+[profile.dev.build-override]
+opt-level = "z"
+
+[profile.dev.package."*"]
+opt-level = "z"
+
+# All this is great just slow af so turn on when needed.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
+
+[profile.release.build-override]
+codegen-units = 1
+opt-level = "z"
+strip = "debuginfo"
+
+[profile.release.package."*"]
+codegen-units = 1
+opt-level = "z"
+strip = "debuginfo"

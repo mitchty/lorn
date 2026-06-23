@@ -1,0 +1,184 @@
+name: Pre-Release Build
+
+on:
+  push:
+    branches:
+      - main
+      - shenanigans
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Run flake checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Configure Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Run flake check
+        run: nix flake check -L
+
+  build-linux:
+    name: Build Linux (static musl)
+    runs-on: ubuntu-latest
+    needs: [check]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Configure Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build Linux static binary
+        run: nix build .#lorn-release-linux -L
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp result/bin/lorn dist/lorn-linux-x86_64
+          chmod +x dist/lorn-linux-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lorn-linux-x86_64
+          path: dist/lorn-linux-x86_64
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows (MinGW cross-compile)
+    runs-on: ubuntu-latest
+    needs: [check]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Configure Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build Windows binary
+        run: nix build .#lorn-release-windows -L
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp result/bin/lorn.exe dist/lorn-windows-x86_64.exe
+          chmod +x dist/lorn-windows-x86_64.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lorn-windows-x86_64
+          path: dist/lorn-windows-x86_64.exe
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS (system libs only)
+    runs-on: macos-latest
+    needs: [check]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Configure Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build macOS binary
+        run: nix build .#lorn-release -L
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p dist
+          cp result/bin/lorn dist/lorn-darwin-aarch64
+          chmod +x dist/lorn-darwin-aarch64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lorn-darwin-aarch64
+          path: dist/lorn-darwin-aarch64
+          if-no-files-found: error
+
+  create-prerelease:
+    name: Create Pre-Release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          cp artifacts/lorn-linux-x86_64/lorn-linux-x86_64 release/
+          cp artifacts/lorn-windows-x86_64/lorn-windows-x86_64.exe release/
+          cp artifacts/lorn-darwin-aarch64/lorn-darwin-aarch64 release/
+          ls -lh release/
+
+      - name: Delete existing pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view pre-release >/dev/null 2>&1; then
+            echo "Deleting existing pre-release"
+            gh release delete pre-release --yes --cleanup-tag
+          fi
+
+      - name: Create pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create pre-release \
+            --title "latest main" \
+            --notes "automated pre-release build off current main commit
+
+          commit: ${{ github.sha }}
+
+          ### Download Instructions
+
+          **Linux (x86_64):**
+          \`\`\`bash
+          curl -Lo lorn https://github.com/${{ github.repository }}/releases/download/pre-release/lorn-linux-x86_64
+          chmod +x lorn
+          ./lorn --version
+          \`\`\`
+
+          **macOS (Apple Silicon):**
+          \`\`\`bash
+          curl -Lo lorn https://github.com/${{ github.repository }}/releases/download/pre-release/lorn-darwin-aarch64
+          chmod +x lorn
+          ./lorn --version
+          \`\`\`
+
+          **Windows (x86_64):**
+          Download \`lorn-windows-x86_64.exe\` and run in PowerShell or Command Prompt.
+
+          ---
+          **Note:** These are pre-release builds from the main development branch and may be unstable." \
+            --prerelease \
+            --draft \
+            release/lorn-linux-x86_64 \
+            release/lorn-windows-x86_64.exe \
+            release/lorn-darwin-aarch64
