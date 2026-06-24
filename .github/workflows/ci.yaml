@@ -1,10 +1,12 @@
-name: Pre-Release Build
+name: ci
 
 on:
   push:
     branches:
       - main
       - shenanigans
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
 
 permissions:
   contents: write
@@ -118,6 +120,7 @@ jobs:
 
   create-prerelease:
     name: Create Pre-Release
+    if: github.ref_type == 'branch'
     needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
@@ -180,6 +183,61 @@ jobs:
           **Note:** These are pre-release builds from the main development branch and may be unstable." \
             --prerelease \
             --draft \
+            release/lorn-linux-x86_64 \
+            release/lorn-windows-x86_64.exe \
+            release/lorn-darwin-aarch64
+
+  create-release:
+    name: Create Release
+    if: github.ref_type == 'tag'
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          cp artifacts/lorn-linux-x86_64/lorn-linux-x86_64 release/
+          cp artifacts/lorn-windows-x86_64/lorn-windows-x86_64.exe release/
+          cp artifacts/lorn-darwin-aarch64/lorn-darwin-aarch64 release/
+          ls -lh release/
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --target ${{ github.sha }} \
+            --title "${{ github.ref_name }}" \
+            --notes "release ${{ github.ref_name }}
+
+          commit: ${{ github.sha }}
+
+          ### Download Instructions
+
+          **Linux (x86_64):**
+          \`\`\`bash
+          curl -Lo lorn https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/lorn-linux-x86_64
+          chmod +x lorn
+          ./lorn --version
+          \`\`\`
+
+          **macOS (Apple Silicon):**
+          \`\`\`bash
+          curl -Lo lorn https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/lorn-darwin-aarch64
+          chmod +x lorn
+          ./lorn --version
+          \`\`\`
+
+          **Windows (x86_64):**
+          Download \`lorn-windows-x86_64.exe\` and run in PowerShell or Command Prompt." \
             release/lorn-linux-x86_64 \
             release/lorn-windows-x86_64.exe \
             release/lorn-darwin-aarch64

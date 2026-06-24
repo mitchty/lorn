@@ -1,14 +1,14 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use futures::future::try_join_all;
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
     batch::v1::Job,
-    core::v1::{Namespace, PersistentVolumeClaim, Pod, PodSpec},
+    core::v1::{Namespace, PersistentVolume, PersistentVolumeClaim, Pod, PodSpec},
 };
 use kube::{
     Client, Config,
-    api::{Api, ListParams},
+    api::{Api, ApiResource, DynamicObject, ListParams},
     config::{KubeConfigOptions, Kubeconfig},
 };
 use thiserror::Error;
@@ -334,12 +334,95 @@ async fn find_bitnami_images(client: &Client) -> Result<Vec<BitnamiHit>, LornErr
     Ok(nested.into_iter().flatten().collect())
 }
 
+#[derive(Debug)]
+struct CsiNoSnapshot {
+    /// csi driver name according to the k8s api, e.g. `ebs.csi.aws.com` or `csi.san.synology.com`
+    driver: String,
+    /// PV names that are actively using this driver.
+    pvs: Vec<String>,
+    /// True when the VolumeSnapshotClass CRD itself is not installed for this csi driver.
+    // Note: this would be for a local path provisioner.
+    crd_missing: bool,
+}
+
+async fn find_csi_no_snapshot(client: &Client) -> Result<Vec<CsiNoSnapshot>, LornError> {
+    let pv_api: Api<PersistentVolume> = Api::all(client.clone());
+
+    let vsc_ar = ApiResource {
+        group: "snapshot.storage.k8s.io".into(),
+        version: "v1".into(),
+        api_version: "snapshot.storage.k8s.io/v1".into(),
+        kind: "VolumeSnapshotClass".into(),
+        plural: "volumesnapshotclasses".into(),
+    };
+    let vsc_api: Api<DynamicObject> = Api::all_with(client.clone(), &vsc_ar);
+
+    let lp = ListParams::default();
+    let (pvs_result, vscs_result) = tokio::join!(pv_api.list(&lp), vsc_api.list(&lp),);
+
+    let pvs = pvs_result?;
+
+    // CSI drivers that have at least one VolumeSnapshotClass registered. `None`
+    // means the CRD is not installed at all, which is an odd edge case but can
+    // happen if the clsuter only has local-path provisioner and throws the
+    // overall logic off of assuming the CRD exists at all times whenever there
+    // is a storage class.
+    let (snapshot_capable, crd_missing): (BTreeSet<String>, bool) = match vscs_result {
+        Ok(list) => {
+            let drivers = list
+                .items
+                .iter()
+                .filter_map(|vsc| {
+                    vsc.data
+                        .get("driver")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            (drivers, false)
+        }
+        // This technically indicates the CRD for snapshots doesn't exist at all.
+        Err(kube::Error::Api(ref err)) if err.code == 404 => (BTreeSet::new(), true),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut by_driver: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for pv in &pvs.items {
+        if let Some(csi) = pv.spec.as_ref().and_then(|s| s.csi.as_ref()) {
+            let driver = &csi.driver;
+            if crd_missing || !snapshot_capable.contains(driver) {
+                by_driver.entry(driver.clone()).or_default().push(
+                    pv.metadata
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "<unnamed>".into()),
+                );
+            }
+        }
+    }
+
+    Ok(by_driver
+        .into_iter()
+        .map(|(driver, mut pvs)| {
+            pvs.sort();
+            CsiNoSnapshot {
+                driver,
+                pvs,
+                crd_missing,
+            }
+        })
+        .collect())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), LornError> {
     let client = build_client().await?;
 
-    let (orphaned_pvcs, bitnami_hits) =
-        tokio::try_join!(find_orphaned_pvcs(&client), find_bitnami_images(&client),)?;
+    let (orphaned_pvcs, bitnami_hits, csi_no_snapshot) = tokio::try_join!(
+        find_orphaned_pvcs(&client),
+        find_bitnami_images(&client),
+        find_csi_no_snapshot(&client),
+    )?;
 
     let mut found = false;
 
@@ -354,6 +437,17 @@ async fn main() -> Result<(), LornError> {
             hit.kind, hit.name, hit.container_path, hit.image
         );
         found = true;
+    }
+
+    for hit in &csi_no_snapshot {
+        for pv in &hit.pvs {
+            if hit.crd_missing {
+                println!("{} missing snapshot capability for pv {pv}", hit.driver);
+            } else {
+                println!("csi {} has no snapshot crd for pv {pv}", hit.driver);
+            }
+            found = true;
+        }
     }
 
     if found {

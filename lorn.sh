@@ -77,6 +77,32 @@ for ns in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}'); do
     done
 done
 
+if kubectl get volumesnapshotclasses.snapshot.storage.k8s.io -o json > /dev/null 2>&1; then
+  crd_present=1
+else
+  crd_present=0
+fi
+
+if [ "$crd_present" -eq 1 ]; then
+  capable_drivers=$(kubectl get volumesnapshotclasses.snapshot.storage.k8s.io -o json | jq -r '.items[].driver')
+else
+  capable_drivers=""
+  printf 'no VolumeSnapshotClass CRD installed (snapshot.storage.k8s.io): velero cannot use native CSI snapshots\n'
+  touch "$found"
+fi
+
+kubectl get pv -o json | jq -r '.items[] | select(.spec.csi != null) | [.metadata.name, .spec.csi.driver] | @tsv' | while IFS=$(printf '\t') read -r pv driver; do
+  if [ "$crd_present" -eq 0 ]; then
+    printf '%s missing snapshot capability for pv %s\n' "$driver" "$pv"
+    touch "$found"
+  else
+    if ! printf '%s\n' "$capable_drivers" | grep -qxF "$driver"; then
+      printf 'csi %s has no snapshot crd for pv %s\n' "$driver" "$pv"
+      touch "$found"
+    fi
+  fi
+done
+
 if [ -f "$found" ]; then
   exit 1
 fi

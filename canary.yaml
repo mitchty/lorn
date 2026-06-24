@@ -48,3 +48,65 @@ spec:
     - name: wait
       image: bitnami/kubectl:1.29
   restartPolicy: Never
+---
+# This is a silly way to approach it, but you also need the local-path
+# provisioner for this to be useful. Note, if your default storage class doesn't
+# support snapshots you can ignore this part of the canary.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: lorn-test-csi-noss-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: lorn-test-csi-noss
+  csi:
+    driver: rancher.io/local-path
+    volumeHandle: lorn-test-csi-noss-pv
+    fsType: ext4
+  hostPath:
+    path: /tmp/lorn-test-csi-noss
+    type: DirectoryOrCreate
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lorn-test-csi-noss
+provisioner: rancher.io/local-path
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lorn-test-csi-noss-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: lorn-test-csi-noss
+  volumeName: lorn-test-csi-noss-pv
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lorn-test-csi-noss-pod
+  namespace: default
+spec:
+  containers:
+    - name: busybox
+      image: busybox
+      command: ["sleep", "3600"]
+      volumeMounts:
+        - mountPath: /data
+          name: csi-noss-vol
+  volumes:
+    - name: csi-noss-vol
+      persistentVolumeClaim:
+        claimName: lorn-test-csi-noss-pvc

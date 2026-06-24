@@ -1,6 +1,6 @@
 * Lorn
 
-What is it? Basically a quick check of k8s for orphaned resources or things that are "lost". For now that basically means orphaned pv/pvc's and if any bitnami images are found.
+What is it? Basically a quick check of k8s for orphaned resources or things that are "lost". For now that basically means orphaned pv/pvc's, bitnami images, and CSI volumes whose driver has no ~VolumeSnapshotClass~ or have no CSI driver that can support snapshots.
 
 ** Usage
 
@@ -17,6 +17,7 @@ orphaned pvc: default/orphan-test-pvc pv: pvc-02063219-9a71-418f-a3e6-f510142f2e
 pod default/lorn-test-bitnami spec.containers[0].image: bitnami/redis:7.0.15
 pod default/lorn-test-bitnami spec.containers[1].image: docker.io/bitnami/nginx:1.25.4
 pod default/lorn-test-bitnami spec.initContainers[0].image: bitnami/kubectl:1.29
+csi driver: rancher.io/local-path has no VolumeSnapshotClass pv: lorn-test-csi-noss-pv
 zsh: exit 1     lorn
 #+end_src
 
@@ -30,10 +31,16 @@ To test out that this finds what is expected, there is a `canary.yaml` file at t
 kubectl apply -f canary.yaml
 #+end_src
 
-Then you'll need to manually delete the pod associated with the pv/pvc claim:
+Then you'll need to manually delete the pod associated with the pv/pvc claim to trigger the orphan detection:
 
 #+begin_src sh
 kubectl delete pod orphan-test-pod
+#+end_src
+
+Note for CSI snapshot provider testing the local path provisioner should be setup beforehand as per https://github.com/rancher/local-path-provisioner#installation
+
+#+begin_src sh
+kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.36/deploy/local-path-storage.yaml
 #+end_src
 
 And you should basically get the output in this readme. Cleanup is the same as any other k8s resource:
