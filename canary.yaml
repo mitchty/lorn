@@ -1,0 +1,50 @@
+# Use this to simulate broken stuff this should detect.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: orphan-test-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+#  storageClassName: if you need to set this to a non default storage class
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orphan-test-pod
+  namespace: default
+spec:
+  containers:
+  - name: busybox
+    image: busybox
+    command:
+      - "sleep"
+      - "3600"
+    volumeMounts:
+    - mountPath: /data
+      name: test-vol
+  volumes:
+  - name: test-vol
+    persistentVolumeClaim:
+      claimName: orphan-test-pvc
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lorn-test-bitnami
+  namespace: default
+spec:
+  containers:
+    - name: redis
+      image: bitnami/redis:7.0.15
+    - name: nginx
+      image: docker.io/bitnami/nginx:1.25.4
+  initContainers:
+    - name: wait
+      image: bitnami/kubectl:1.29
+  restartPolicy: Never

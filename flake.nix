@@ -439,6 +439,8 @@
               gitFull
               nil
               stableRust
+              kubectl
+              jq
             ])
             ++ (lib.attrValues hookTools)
             ++ commonArgs.buildInputs

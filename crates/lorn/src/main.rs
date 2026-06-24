@@ -344,13 +344,13 @@ async fn main() -> Result<(), LornError> {
     let mut found = false;
 
     for (ns, pvc_name, pv_name) in orphaned_pvcs {
-        println!("orphaned pvc: {ns}/{pvc_name} pv: {pv_name}");
+        println!("orphaned pvc {ns}/{pvc_name} pv {pv_name}");
         found = true;
     }
 
     for hit in bitnami_hits {
         println!(
-            "{} {} {}.image: {}",
+            "{} {} {}.image {}",
             hit.kind, hit.name, hit.container_path, hit.image
         );
         found = true;

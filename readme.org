@@ -1,0 +1,66 @@
+* Lorn
+
+What is it? Basically a quick check of k8s for orphaned resources or things that are "lost". For now that basically means orphaned pv/pvc's and if any bitnami images are found.
+
+** Usage
+
+Just download it and run it for the plaform you need. Its a static binary for windows/linux and a *mostly* static binary for macos aarch64 (note fully static binaries aren't technically allowed even if they are possible).
+
+Note you will need to have *KUBECONFIG* set for this to work. There is no arg parsing right now so only the *KUBECONFIG* var controls where it looks for data.
+
+
+Example run with an intentionally broken upstream k8s setup:
+
+#+begin_src sh
+$ lorn
+orphaned pvc: default/orphan-test-pvc pv: pvc-02063219-9a71-418f-a3e6-f510142f2ed6
+pod default/lorn-test-bitnami spec.containers[0].image: bitnami/redis:7.0.15
+pod default/lorn-test-bitnami spec.containers[1].image: docker.io/bitnami/nginx:1.25.4
+pod default/lorn-test-bitnami spec.initContainers[0].image: bitnami/kubectl:1.29
+zsh: exit 1     lorn
+#+end_src
+
+If nothing is found there should be no output and return code should be 0. If anything lorn or even forlorn is found the return code will be non zero and stdout should have the details about what it was.
+
+** Validation
+
+To test out that this finds what is expected, there is a `canary.yaml` file at the root of the repo that you may apply via kubectl:
+
+#+begin_src sh
+kubectl apply -f canary.yaml
+#+end_src
+
+Then you'll need to manually delete the pod associated with the pv/pvc claim:
+
+#+begin_src sh
+kubectl delete pod orphan-test-pod
+#+end_src
+
+And you should basically get the output in this readme. Cleanup is the same as any other k8s resource:
+
+#+begin_src sh
+kubectl delete -f canary.yaml
+#+end_src
+
+** Why?
+
+Well... its mostly doing parallel work in bourne shell, and note I don't mean bash, is... less than pleasant and when you do the same work serially via kubectl/sh/pipes the fork()/exec() costs add up time wise, this example is on a mostly empty cluster too it gets worse from here:
+
+#+begin_src sh
+$ time lorn
+orphaned pvc default/orphan-test-pvc pv pvc-20eed88c-4acb-433b-9bef-b47af39b828e
+pod default/lorn-test-bitnami spec.containers[0].image bitnami/redis:7.0.15
+pod default/lorn-test-bitnami spec.containers[1].image docker.io/bitnami/nginx:1.25.4
+pod default/lorn-test-bitnami spec.initContainers[0].image bitnami/kubectl:1.29
+zsh: exit 1     lorn
+lorn  0.18s user 0.15s system 113% cpu 0.298 total
+$ time lorn.sh
+orphaned pvc default/orphan-test-pvc pv pvc-20eed88c-4acb-433b-9bef-b47af39b828e
+pod default/lorn-test-bitnami spec.containers[0].image legacy image bitnami/redis:7.0.15
+pod default/lorn-test-bitnami spec.containers[1].image legacy image docker.io/bitnami/nginx:1.25.4
+pod default/lorn-test-bitnami spec.initContainers[0].image legacy image bitnami/kubectl:1.29
+zsh: exit 1     lorn.sh
+lorn.sh  26.17s user 9.86s system 223% cpu 16.145 total
+#+end_src
+
+The time starts to add up. Note that lorn.sh is always here if you don't trust binaries built on github actions. It'll just take longer to do the same work and you'll need to ensure kubectl and jq are present on the running machine. If they are missing the script will just fail on the first kubectl exec().
