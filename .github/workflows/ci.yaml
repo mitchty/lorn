@@ -146,7 +146,8 @@ jobs:
         run: |
           if gh release view pre-release >/dev/null 2>&1; then
             echo "Deleting existing pre-release"
-            gh release delete pre-release --yes --cleanup-tag
+            # Don't fail if there is no pre-release already.
+            gh release delete pre-release --yes --cleanup-tag || true
           fi
 
       - name: Create pre-release
