@@ -2,16 +2,21 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use futures::future::try_join_all;
 use k8s_openapi::api::{
-    apps::v1::{Deployment, StatefulSet},
+    apps::v1::{Deployment, ReplicaSet, StatefulSet},
     batch::v1::Job,
-    core::v1::{Namespace, PersistentVolume, PersistentVolumeClaim, Pod, PodSpec},
+    core::v1::{
+        Container, Namespace, PersistentVolume, PersistentVolumeClaim, Pod, PodSecurityContext,
+        PodSpec, SecurityContext, Service, ServicePort,
+    },
 };
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::{
     Client, Config,
     api::{Api, ApiResource, DynamicObject, ListParams},
     config::{KubeConfigOptions, Kubeconfig},
 };
 use thiserror::Error;
+use tracing::{error, warn};
 
 #[derive(Debug, Error)]
 enum LornError {
@@ -315,17 +320,12 @@ async fn find_bitnami_images_in_ns(
     Ok(pod_hits)
 }
 
-async fn find_bitnami_images(client: &Client) -> Result<Vec<BitnamiHit>, LornError> {
-    let namespaces = Api::<Namespace>::all(client.clone())
-        .list(&ListParams::default())
-        .await?;
-
-    let per_ns = namespaces.items.iter().map(|ns_obj| {
-        let ns = ns_obj
-            .metadata
-            .name
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
+async fn find_bitnami_images(
+    client: &Client,
+    namespaces: &[String],
+) -> Result<Vec<BitnamiHit>, LornError> {
+    let per_ns = namespaces.iter().map(|ns| {
+        let ns = ns.clone();
         let client = client.clone();
         async move { find_bitnami_images_in_ns(&client, &ns).await }
     });
@@ -414,17 +414,378 @@ async fn find_csi_no_snapshot(client: &Client) -> Result<Vec<CsiNoSnapshot>, Lor
         .collect())
 }
 
+/// Whether we were able to confirm a socket is actually bound to a
+/// privileged port inside a pod's network namespace, via a best effort
+/// port forward attempt. Mostly we want the Bound state for confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortBindState {
+    /// The probe found something bound to a socket at this port.
+    Bound,
+    /// The probe came back with a "connection refused" type of error: nothing
+    /// is listening in this instance. Strong evidence the finding that led here
+    /// is a false positive or for some reason a pod is configured to use a port
+    /// but not actually bind()'ng to it.
+    Unbound,
+    /// Couldn't determine either way or its ambiguous. There is only so much I
+    /// can do to try to find ports actually bound from within k8s with no
+    /// access to the underlying systems to nsenter into the pod's net namespace
+    /// and truly see what's bound.
+    Unknown,
+}
+
+impl std::fmt::Display for PortBindState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            PortBindState::Bound => "bound",
+            PortBindState::Unbound => "unbound",
+            PortBindState::Unknown => "unknown",
+        };
+        f.write_str(s)
+    }
+}
+
+#[derive(Debug)]
+struct PrivilegedServicePod {
+    namespace: String,
+    pod_name: String,
+    service_name: String,
+    port: i32,
+    protocol: String,
+    bind_state: PortBindState,
+    /// Lowercased k8s kind of the owning workload, e.g. `deployment`,
+    /// `statefulset`, `replicaset`, or `pod` if it has no controller.
+    // If this were a more grown up program this would be an enum.
+    owner_kind: String,
+    owner_name: String,
+}
+
+/// Try to find out if a pod has the ability/k8s setup to bind to ports below
+/// 1024. I think this is all most of what would allow this to happen.
+fn can_bind_privileged_port(
+    pod_sc: Option<&PodSecurityContext>,
+    container_sc: Option<&SecurityContext>,
+    port: i32,
+) -> bool {
+    if container_sc.and_then(|sc| sc.privileged).unwrap_or(false) {
+        return true;
+    }
+
+    let has_bind_capability = container_sc
+        .and_then(|sc| sc.capabilities.as_ref())
+        .and_then(|caps| caps.add.as_ref())
+        .is_some_and(|added| added.iter().any(|c| c == "NET_BIND_SERVICE" || c == "ALL"));
+    if has_bind_capability {
+        return true;
+    }
+
+    let run_as_user = container_sc
+        .and_then(|sc| sc.run_as_user)
+        .or_else(|| pod_sc.and_then(|sc| sc.run_as_user));
+    if run_as_user == Some(0) {
+        return true;
+    }
+
+    pod_sc
+        .and_then(|sc| sc.sysctls.as_ref())
+        .into_iter()
+        .flatten()
+        .filter(|s| s.name == "net.ipv4.ip_unprivileged_port_start")
+        .filter_map(|s| s.value.trim().parse::<i32>().ok())
+        .any(|threshold| threshold <= port)
+}
+
+/// Finds the container, be it regular or an init container in a pod spec that
+/// declares the given `containerPort`, if any.
+fn container_for_port(pod_spec: &PodSpec, port: i32) -> Option<&Container> {
+    pod_spec
+        .containers
+        .iter()
+        .chain(pod_spec.init_containers.iter().flatten())
+        .find(|c| c.ports.iter().flatten().any(|p| p.container_port == port))
+}
+
+fn resolve_target_port(sp: &ServicePort, pod_spec: &PodSpec) -> Option<i32> {
+    let (port, container) = match sp.target_port.as_ref() {
+        Some(IntOrString::Int(n)) => (*n, container_for_port(pod_spec, *n)),
+        Some(IntOrString::String(name)) => pod_spec
+            .containers
+            .iter()
+            .chain(pod_spec.init_containers.iter().flatten())
+            .find_map(|c| {
+                c.ports
+                    .iter()
+                    .flatten()
+                    .find(|p| p.name.as_deref() == Some(name.as_str()))
+                    .map(|p| (p.container_port, Some(c)))
+            })?,
+        None => (sp.port, container_for_port(pod_spec, sp.port)),
+    };
+
+    if port >= 1024 {
+        return None;
+    }
+
+    let can_bind = can_bind_privileged_port(
+        pod_spec.security_context.as_ref(),
+        container.and_then(|c| c.security_context.as_ref()),
+        port,
+    );
+    (!can_bind).then_some(port)
+}
+
+/// Best effort, dependency free (no exec and cat /proc/net/tcp... basically)
+/// confirmation that a tcp port has an actual bound socket inside a pod's
+/// network namespace: open a portforward session to it and watches for
+/// an immediate "connection refused" style error, which kubelet's port-forward
+/// helper reports when nothing is listening/bound on the other end.
+async fn confirm_bound_port(
+    client: &Client,
+    ns: &str,
+    pod: &str,
+    port: i32,
+    protocol: &str,
+) -> PortBindState {
+    if !protocol.eq_ignore_ascii_case("tcp") {
+        return PortBindState::Unknown;
+    }
+
+    let Ok(port) = u16::try_from(port) else {
+        return PortBindState::Unknown;
+    };
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), ns);
+
+    let Ok(mut pf) = pods_api.portforward(pod, &[port]).await else {
+        return PortBindState::Unknown;
+    };
+    let Some(error_fut) = pf.take_error(port) else {
+        return PortBindState::Unknown;
+    };
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), error_fut).await;
+    pf.abort();
+
+    match result {
+        // The port errored out before the timeout. A refused connection
+        // means nothing is bound for sure, anything else is too ambiguous to
+        // treat as a disproof which could mean kubelet itself can't port forward.
+        Ok(Some(message)) => {
+            // TODO: This may not be complete enough but I can't make heads or
+            // tails of kubectl's port forward source right now for the rest of
+            // the issues that might need to be added, this one for sure though.
+            if message.to_lowercase().contains("connection refused") {
+                PortBindState::Unbound
+            } else {
+                PortBindState::Unknown
+            }
+        }
+        // Error sender was dropped without ever sending which should mean the
+        // port was usable the whole time we were watching.
+        Ok(None) => PortBindState::Bound,
+        // No error surfaced before the timeout. Since we're forwarding
+        // to the pod's own loopback-equivalent, a refusal should show up
+        // nearly instantly, so treat this as there is a port bound.
+        Err(_) => PortBindState::Bound,
+    }
+}
+
+/// Walk a pod's owner references to find the top level workload
+/// that owns it. `ReplicaSet`s are resolved one level further to
+/// their owning `Deployment` when possible so the more useful, user
+/// facing resource is listed at the end.
+fn owner_workload_for_pod(pod: &Pod, replicasets: &[ReplicaSet]) -> (String, String) {
+    let controller_owner = pod
+        .metadata
+        .owner_references
+        .as_ref()
+        .and_then(|refs| refs.iter().find(|r| r.controller == Some(true)));
+
+    let Some(owner) = controller_owner else {
+        let name = pod
+            .metadata
+            .name
+            .clone()
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        return ("pod".to_string(), name);
+    };
+
+    if owner.kind == "ReplicaSet" {
+        let rs_owner = replicasets
+            .iter()
+            .find(|rs| rs.metadata.name.as_deref() == Some(owner.name.as_str()))
+            .and_then(|rs| rs.metadata.owner_references.as_ref())
+            .and_then(|refs| refs.iter().find(|r| r.controller == Some(true)));
+
+        if let Some(rs_owner) = rs_owner {
+            return (rs_owner.kind.to_lowercase(), rs_owner.name.clone());
+        }
+        return ("replicaset".to_string(), owner.name.clone());
+    }
+
+    (owner.kind.to_lowercase(), owner.name.clone())
+}
+
+async fn find_privileged_service_pods_in_ns(
+    client: &Client,
+    ns: &str,
+) -> Result<Vec<PrivilegedServicePod>, LornError> {
+    let lp = ListParams::default();
+
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), ns);
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let rs_api: Api<ReplicaSet> = Api::namespaced(client.clone(), ns);
+
+    let (services, pods, replicasets) =
+        tokio::try_join!(svc_api.list(&lp), pods_api.list(&lp), rs_api.list(&lp))?;
+
+    let mut hits = Vec::new();
+
+    for svc in &services.items {
+        let Some(spec) = svc.spec.as_ref() else {
+            continue;
+        };
+
+        let Some(selector) = spec.selector.as_ref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+
+        let service_ports: Vec<&ServicePort> = spec.ports.iter().flatten().collect();
+
+        let service_name = svc
+            .metadata
+            .name
+            .clone()
+            .unwrap_or_else(|| "<unnamed>".to_string());
+
+        for pod in &pods.items {
+            let Some(pod_spec) = pod.spec.as_ref() else {
+                continue;
+            };
+
+            let matches = pod
+                .metadata
+                .labels
+                .as_ref()
+                .is_some_and(|labels| selector.iter().all(|(k, v)| labels.get(k) == Some(v)));
+            if !matches {
+                continue;
+            }
+
+            // Dedup by (port, protocol) in case multiple service ports resolve
+            // to the same target port. How? I dunno but I got dups without
+            // this.
+            let mut privileged: BTreeSet<(i32, String)> = BTreeSet::new();
+
+            for sp in &service_ports {
+                if let Some(resolved) = resolve_target_port(sp, pod_spec) {
+                    let protocol = sp.protocol.clone().unwrap_or_else(|| "TCP".to_string());
+                    privileged.insert((resolved, protocol));
+                }
+            }
+
+            if privileged.is_empty() {
+                continue;
+            }
+
+            let pod_name = pod
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| "<unnamed>".to_string());
+            let (owner_kind, owner_name) = owner_workload_for_pod(pod, &replicasets.items);
+
+            for (port, protocol) in privileged {
+                // Ignore anything we know isn't actively bound. Bound and Unknown filter up
+                let bind_state = confirm_bound_port(client, ns, &pod_name, port, &protocol).await;
+                if bind_state == PortBindState::Unbound {
+                    continue;
+                }
+
+                hits.push(PrivilegedServicePod {
+                    namespace: ns.to_string(),
+                    pod_name: pod_name.clone(),
+                    service_name: service_name.clone(),
+                    port,
+                    protocol,
+                    bind_state,
+                    owner_kind: owner_kind.clone(),
+                    owner_name: owner_name.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
+async fn find_privileged_service_pods(
+    client: &Client,
+    namespaces: &[String],
+) -> Result<Vec<PrivilegedServicePod>, LornError> {
+    let per_ns = namespaces.iter().map(|ns| {
+        let ns = ns.clone();
+        let client = client.clone();
+        async move { find_privileged_service_pods_in_ns(&client, &ns).await }
+    });
+
+    let nested = try_join_all(per_ns).await?;
+    Ok(nested.into_iter().flatten().collect())
+}
+
+/// Lists all namespace names in the cluster. Some environments (certain
+/// AKS RBAC setups in particular) grant access to namespaced resources
+/// but deny `list` on the cluster-scoped `namespaces` resource itself,
+/// so callers should treat a failure here as "namespace-scoped checks
+/// can't run" rather than a fatal error for the whole program.
+async fn list_namespace_names(client: &Client) -> Result<Vec<String>, LornError> {
+    let namespaces = Api::<Namespace>::all(client.clone())
+        .list(&ListParams::default())
+        .await?;
+
+    Ok(namespaces
+        .items
+        .into_iter()
+        .map(|ns| ns.metadata.name.unwrap_or_else(|| "default".to_string()))
+        .collect())
+}
+
 #[tokio::main]
-async fn main() -> Result<(), LornError> {
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    if let Err(err) = run().await {
+        error!("{err}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), LornError> {
     let client = build_client().await?;
 
-    let (orphaned_pvcs, bitnami_hits, csi_no_snapshot) = tokio::try_join!(
-        find_orphaned_pvcs(&client),
-        find_bitnami_images(&client),
-        find_csi_no_snapshot(&client),
-    )?;
-
     let mut found = false;
+
+    // Namespace-scoped checks may fail with the user RBAC. So try to note that.
+    let namespaces = match list_namespace_names(&client).await {
+        Ok(namespaces) => namespaces,
+        Err(err) => {
+            warn!(
+                "unable to list namespaces, skipping namespace-scoped checks e.g. bitnami images and privileged service ports err was: {err}"
+            );
+            found = true;
+            Vec::new()
+        }
+    };
+
+    let (orphaned_pvcs, bitnami_hits, csi_no_snapshot, privileged_service_pods) = tokio::try_join!(
+        find_orphaned_pvcs(&client),
+        find_bitnami_images(&client, &namespaces),
+        find_csi_no_snapshot(&client),
+        find_privileged_service_pods(&client, &namespaces),
+    )?;
 
     for (ns, pvc_name, pv_name) in orphaned_pvcs {
         println!("orphaned pvc {ns}/{pvc_name} pv {pv_name}");
@@ -448,6 +809,21 @@ async fn main() -> Result<(), LornError> {
             }
             found = true;
         }
+    }
+
+    for hit in privileged_service_pods {
+        println!(
+            "pod {}/{} service {} targetPort {}/{} state {} owner {} {}",
+            hit.namespace,
+            hit.pod_name,
+            hit.service_name,
+            hit.port,
+            hit.protocol,
+            hit.bind_state,
+            hit.owner_kind,
+            hit.owner_name
+        );
+        found = true;
     }
 
     if found {

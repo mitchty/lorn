@@ -49,25 +49,6 @@ And you should basically get the output in this readme. Cleanup is the same as a
 kubectl delete -f canary.yaml
 #+end_src
 
-** Why?
+** Why only rust?
 
-Well... its mostly doing parallel work in bourne shell, and note I don't mean bash, is... less than pleasant and when you do the same work serially via kubectl/sh/pipes the fork()/exec() costs add up time wise, this example is on a mostly empty cluster too it gets worse from here:
-
-#+begin_src sh
-$ time lorn
-orphaned pvc default/orphan-test-pvc pv pvc-20eed88c-4acb-433b-9bef-b47af39b828e
-pod default/lorn-test-bitnami spec.containers[0].image bitnami/redis:7.0.15
-pod default/lorn-test-bitnami spec.containers[1].image docker.io/bitnami/nginx:1.25.4
-pod default/lorn-test-bitnami spec.initContainers[0].image bitnami/kubectl:1.29
-zsh: exit 1     lorn
-lorn  0.18s user 0.15s system 113% cpu 0.298 total
-$ time lorn.sh
-orphaned pvc default/orphan-test-pvc pv pvc-20eed88c-4acb-433b-9bef-b47af39b828e
-pod default/lorn-test-bitnami spec.containers[0].image legacy image bitnami/redis:7.0.15
-pod default/lorn-test-bitnami spec.containers[1].image legacy image docker.io/bitnami/nginx:1.25.4
-pod default/lorn-test-bitnami spec.initContainers[0].image legacy image bitnami/kubectl:1.29
-zsh: exit 1     lorn.sh
-lorn.sh  26.17s user 9.86s system 223% cpu 16.145 total
-#+end_src
-
-The time starts to add up. Note that lorn.sh is always here if you don't trust binaries built on github actions. It'll just take longer to do the same work and you'll need to ensure kubectl and jq are present on the running machine. If they are missing the script will just fail on the first kubectl exec().
+A prior version of lorn shipped a parallel `lorn.sh` shell implementation using kubectl and jq for folks who didn't trust binaries built on github actions. It has been dropped: doing the same work serially via kubectl/sh/pipes has real fork()/exec() and more importantly sanity trying to use jq cost that adds up, and the shell logic needed to keep pace with the Rust implementation owner resolution, securityContext aware checks, etc. was no longer worth the added maintenance burden. If you need to build from source and don't trust prebuilt binaries, build the Rust binary locally.
