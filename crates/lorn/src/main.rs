@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::future::Future;
+use std::time::Duration;
 
+use clap::Parser;
 use futures::future::try_join_all;
 use k8s_openapi::api::{
     apps::v1::{Deployment, ReplicaSet, StatefulSet},
@@ -18,6 +21,35 @@ use kube::{
 use thiserror::Error;
 use tracing::{error, warn};
 
+/// they shouldn't be able to bind.
+#[derive(Debug, Parser)]
+#[command(name = "lorn", version, about, long_about = None)]
+struct Cli {
+    /// Path to a kubeconfig file, fall back to the KUBECONFIG env var, then
+    /// in-cluster/default config discovery if unset.
+    #[arg(long, env = "KUBECONFIG")]
+    kubeconfig: Option<String>,
+
+    /// Number of retries to attempt when talking to the k8s API server fails
+    /// with a retryable 5xx error while creating the client for now.
+    #[arg(long, default_value_t = 5)]
+    retries: u32,
+
+    /// Initial backoff delay, in milliseconds, before the first retry. Each
+    /// subsequent retry doubles this delay with a circuit breaker.
+    #[arg(long, default_value_t = 250)]
+    retry_initial_backoff_ms: u64,
+
+    /// Maximum backoff delay, in milliseconds, between retries.
+    #[arg(long, default_value_t = 10_000)]
+    retry_max_backoff_ms: u64,
+
+    /// Increase log verbosity. Overridden by the RUST_LOG env var if set in the
+    /// user env.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+
 #[derive(Debug, Error)]
 enum LornError {
     #[error("kube error: {0}")]
@@ -28,15 +60,61 @@ enum LornError {
     InferConfig(#[from] kube::config::InferConfigError),
 }
 
-async fn build_client() -> Result<Client, LornError> {
-    if let Ok(path) = std::env::var("KUBECONFIG") {
-        let kubeconfig = Kubeconfig::read_from(std::path::Path::new(&path))?;
-        let config =
-            Config::from_custom_kubeconfig(kubeconfig, &KubeConfigOptions::default()).await?;
-        Ok(Client::try_from(config)?)
-    } else {
-        Ok(Client::try_default().await?)
+impl LornError {
+    /// Whether this error looks transient enough to be worth retrying, mostly
+    /// here to retry when we get 5xx from the apiserver when constructing the
+    /// client. Repeated failures is fatal.
+    fn is_retryable(&self) -> bool {
+        matches!(self, LornError::Kube(kube::Error::Api(resp)) if (500..600).contains(&resp.code))
     }
+}
+
+async fn retry_with_backoff<T, F, Fut>(
+    retries: u32,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    mut f: F,
+) -> Result<T, LornError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, LornError>>,
+{
+    let mut attempt = 0;
+    let mut backoff = initial_backoff;
+
+    loop {
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(err) if attempt < retries && err.is_retryable() => {
+                warn!(
+                    "attempt {}/{} failed, retrying in {backoff:?}: {err}",
+                    attempt + 1,
+                    retries + 1,
+                );
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+                backoff = (backoff * 2).min(max_backoff);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn build_client(cli: &Cli) -> Result<Client, LornError> {
+    let initial_backoff = Duration::from_millis(cli.retry_initial_backoff_ms);
+    let max_backoff = Duration::from_millis(cli.retry_max_backoff_ms);
+
+    retry_with_backoff(cli.retries, initial_backoff, max_backoff, || async {
+        if let Some(path) = cli.kubeconfig.as_ref() {
+            let kubeconfig = Kubeconfig::read_from(std::path::Path::new(path))?;
+            let config =
+                Config::from_custom_kubeconfig(kubeconfig, &KubeConfigOptions::default()).await?;
+            Ok(Client::try_from(config)?)
+        } else {
+            Ok(Client::try_default().await?)
+        }
+    })
+    .await
 }
 
 fn pvc_names_from_volumes<'a>(
@@ -750,21 +828,33 @@ async fn list_namespace_names(client: &Client) -> Result<Vec<String>, LornError>
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+
+    let default_level = match cli.verbose {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+
     tracing_subscriber::fmt()
+        // Logs are on stderr now.
+        .with_writer(std::io::stderr)
+        .with_file(true)
+        .with_line_number(true)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .init();
 
-    if let Err(err) = run().await {
+    if let Err(err) = run(cli).await {
         error!("{err}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), LornError> {
-    let client = build_client().await?;
+async fn run(cli: Cli) -> Result<(), LornError> {
+    let client = build_client(&cli).await?;
 
     let mut found = false;
 

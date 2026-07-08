@@ -9,6 +9,7 @@ name = "lorn"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 futures.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
