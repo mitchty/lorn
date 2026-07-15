@@ -48,6 +48,14 @@ struct Cli {
     /// user env.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Restrict checks to only these namespaces. Comma separated and/or
+    /// repeatable. Cluster-scoped findings aka orphaned PVs, CSI snapshot
+    /// capability are also filtered to only those with a relevant
+    /// PersistentVolume via its claimRef, from one of these namespaces. Invalid
+    /// namespaces causes immediate exit.
+    #[arg(long, value_delimiter = ',')]
+    namespace: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -58,6 +66,8 @@ enum LornError {
     KubeConfig(#[from] kube::config::KubeconfigError),
     #[error("infer config error: {0}")]
     InferConfig(#[from] kube::config::InferConfigError),
+    #[error("namespace(s) not found: {0}")]
+    NamespaceNotFound(String),
 }
 
 impl LornError {
@@ -189,33 +199,47 @@ async fn pvc_in_use(client: &Client, ns: &str, pvc_name: &str) -> Result<bool, L
     Ok(pod_ref || sts_ref || deploy_ref || job_ref)
 }
 
-async fn find_orphaned_pvcs(client: &Client) -> Result<Vec<(String, String, String)>, LornError> {
+async fn find_orphaned_pvcs(
+    client: &Client,
+    namespaces: Option<&HashSet<String>>,
+) -> Result<Vec<(String, String, String)>, LornError> {
     let all_pvcs = Api::<PersistentVolumeClaim>::all(client.clone())
         .list(&ListParams::default())
         .await?;
 
-    let checks = all_pvcs.items.iter().map(|pvc| {
-        let ns = pvc
-            .metadata
-            .namespace
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        let pvc_name = pvc
-            .metadata
-            .name
-            .clone()
-            .unwrap_or_else(|| "<unnamed>".to_string());
-        let pv_name = pvc
-            .spec
-            .as_ref()
-            .and_then(|s| s.volume_name.clone())
-            .unwrap_or_else(|| "<unbound>".to_string());
-        let client = client.clone();
-        async move {
-            let in_use = pvc_in_use(&client, &ns, &pvc_name).await?;
-            Ok::<_, LornError>((ns, pvc_name, pv_name, in_use))
-        }
-    });
+    let checks = all_pvcs
+        .items
+        .iter()
+        .filter(|pvc| match namespaces {
+            None => true,
+            Some(filter) => pvc
+                .metadata
+                .namespace
+                .as_deref()
+                .is_some_and(|ns| filter.contains(ns)),
+        })
+        .map(|pvc| {
+            let ns = pvc
+                .metadata
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let pvc_name = pvc
+                .metadata
+                .name
+                .clone()
+                .unwrap_or_else(|| "<unnamed>".to_string());
+            let pv_name = pvc
+                .spec
+                .as_ref()
+                .and_then(|s| s.volume_name.clone())
+                .unwrap_or_else(|| "<unbound>".to_string());
+            let client = client.clone();
+            async move {
+                let in_use = pvc_in_use(&client, &ns, &pvc_name).await?;
+                Ok::<_, LornError>((ns, pvc_name, pv_name, in_use))
+            }
+        });
 
     let results = try_join_all(checks).await?;
     Ok(results
@@ -423,7 +447,10 @@ struct CsiNoSnapshot {
     crd_missing: bool,
 }
 
-async fn find_csi_no_snapshot(client: &Client) -> Result<Vec<CsiNoSnapshot>, LornError> {
+async fn find_csi_no_snapshot(
+    client: &Client,
+    namespaces: Option<&HashSet<String>>,
+) -> Result<Vec<CsiNoSnapshot>, LornError> {
     let pv_api: Api<PersistentVolume> = Api::all(client.clone());
 
     let vsc_ar = ApiResource {
@@ -466,6 +493,22 @@ async fn find_csi_no_snapshot(client: &Client) -> Result<Vec<CsiNoSnapshot>, Lor
 
     let mut by_driver: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for pv in &pvs.items {
+        // PVs are cluster-scoped, but filterdown to whatever namespace the pvc
+        // is on so only pv's with a pvc in that namespace are displayed. Pv's
+        // with no claimRef are skipped as they aren't actively in the
+        // namespace.
+        if let Some(filter) = namespaces {
+            let originates_in_scope = pv
+                .spec
+                .as_ref()
+                .and_then(|s| s.claim_ref.as_ref())
+                .and_then(|cr| cr.namespace.as_deref())
+                .is_some_and(|ns| filter.contains(ns));
+            if !originates_in_scope {
+                continue;
+            }
+        }
+
         if let Some(csi) = pv.spec.as_ref().and_then(|s| s.csi.as_ref()) {
             let driver = &csi.driver;
             if crd_missing || !snapshot_capable.contains(driver) {
@@ -826,6 +869,30 @@ async fn list_namespace_names(client: &Client) -> Result<Vec<String>, LornError>
         .collect())
 }
 
+async fn validate_namespaces(client: &Client, namespaces: &[String]) -> Result<(), LornError> {
+    let ns_api: Api<Namespace> = Api::all(client.clone());
+
+    let checks = namespaces.iter().map(|ns| {
+        let ns_api = ns_api.clone();
+        let ns = ns.clone();
+        async move {
+            match ns_api.get(&ns).await {
+                Ok(_) => Ok::<Option<String>, LornError>(None),
+                Err(kube::Error::Api(err)) if err.code == 404 => Ok(Some(ns)),
+                Err(err) => Err(err.into()),
+            }
+        }
+    });
+
+    let missing: Vec<String> = try_join_all(checks).await?.into_iter().flatten().collect();
+
+    if !missing.is_empty() {
+        return Err(LornError::NamespaceNotFound(missing.join(", ")));
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -858,22 +925,35 @@ async fn run(cli: Cli) -> Result<(), LornError> {
 
     let mut found = false;
 
+    // If the user asked to constrain things to specific namespaces, fail the
+    // whole run outright if any of them don't actually exist.
+    let requested_namespaces: Option<HashSet<String>> = if cli.namespace.is_empty() {
+        None
+    } else {
+        validate_namespaces(&client, &cli.namespace).await?;
+        Some(cli.namespace.iter().cloned().collect())
+    };
+
     // Namespace-scoped checks may fail with the user RBAC. So try to note that.
-    let namespaces = match list_namespace_names(&client).await {
-        Ok(namespaces) => namespaces,
-        Err(err) => {
-            warn!(
-                "unable to list namespaces, skipping namespace-scoped checks e.g. bitnami images and privileged service ports err was: {err}"
-            );
-            found = true;
-            Vec::new()
+    let namespaces: Vec<String> = if let Some(requested) = &requested_namespaces {
+        requested.iter().cloned().collect()
+    } else {
+        match list_namespace_names(&client).await {
+            Ok(namespaces) => namespaces,
+            Err(err) => {
+                warn!(
+                    "unable to list namespaces, skipping namespace-scoped checks e.g. bitnami images and privileged service ports err was: {err}"
+                );
+                found = true;
+                Vec::new()
+            }
         }
     };
 
     let (orphaned_pvcs, bitnami_hits, csi_no_snapshot, privileged_service_pods) = tokio::try_join!(
-        find_orphaned_pvcs(&client),
+        find_orphaned_pvcs(&client, requested_namespaces.as_ref()),
         find_bitnami_images(&client, &namespaces),
-        find_csi_no_snapshot(&client),
+        find_csi_no_snapshot(&client, requested_namespaces.as_ref()),
         find_privileged_service_pods(&client, &namespaces),
     )?;
 
